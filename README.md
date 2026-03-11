@@ -442,7 +442,7 @@ EVAL = {
 
 **Neural Network Emulation of Biogeochemical Models**
 
-7. Pietropolli, G., Manzoni, L., & Cossarini, G. (2020). Neural Network Approaches to Reconstruct Phytoplankton Time-Series in the Global Ocean. *Remote Sensing*, 12(24), 4156. https://doi.org/10.3390/rs12244156
+7. Martinez E., et al. (2020). Neural Network Approaches to Reconstruct Phytoplankton Time-Series in the Global Ocean. *Remote Sensing*, 12(24), 4156. https://doi.org/10.3390/rs12244156
 
 8. Skákala, J., et al. (2023). Future digital twins: emulating a highly complex marine biogeochemical model with machine learning to predict hypoxia. *Frontiers in Marine Science*, 10, 1058837. https://doi.org/10.3389/fmars.2023.1058837
 
