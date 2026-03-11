@@ -42,7 +42,7 @@ Marine biogeochemical models such as the **Biogeochemical Flux Model (BFM)** are
 
 This repository asks a focused scientific question:
 
-> *Can a simple feedforward neural network learn to emulate the one-step state transitions of an NPZD biogeochemical model, and when chained autoregressively, reproduce the emergent annual cycle — including the spring phytoplankton bloom — without access to the underlying equations?*
+> *Can a simple feedforward neural network learn to emulate the one-step state transitions of an NPZD biogeochemical model, and when chained autoregressively, reproduce the emergent annual cycle, including the spring phytoplankton bloom, without access to the underlying equations?*
 
 The experiment is intentionally scoped for reproducibility on a standard laptop. It serves as a minimal but scientifically grounded proof-of-concept for neural network surrogate modelling of biogeochemical systems, in the spirit of reduced-complexity emulators such as BFM17 [(Smith et al., 2021)](#bibliography).
 
@@ -89,14 +89,14 @@ figures/
 
 ## Features
 
-- **Self-contained data generation** — no external datasets required; all training data is produced by numerically solving the NPZD ODEs across thousands of randomly sampled initial conditions and perturbed ecological parameters.
-- **Physically grounded ODE engine** — implements the classic Fasham-type NPZD system with Eppley temperature dependence, Michaelis-Menten nutrient/light limitation, and Ivlev grazing.
-- **Seasonal forcing** — sinusoidal annual cycles for PAR (Photosynthetically Active Radiation) and SST (Sea Surface Temperature) drive the spring bloom dynamics.
-- **Modular pipeline** — each stage (data generation, training, evaluation) can be run independently or skipped via CLI flags.
-- **Autoregressive rollout evaluation** — the core scientific test: the network predicts its own inputs iteratively over a full 365-day cycle.
-- **Nitrogen conservation tracking** — checks whether total nitrogen $N + P + Z + D$ is conserved through the rollout, a key physical constraint.
-- **Selective figure saving** — individual rollout PNGs are saved every 10th trajectory into `figures/rollouts/`; summary statistics use the full evaluation set.
-- **Fully configurable** — all ecological parameters, network hyperparameters, and training settings are centralised in `config.py`.
+- **Self-contained data generation** → no external datasets required; all training data is produced by numerically solving the NPZD ODEs across thousands of randomly sampled initial conditions and perturbed ecological parameters.
+- **Physically grounded ODE engine** → implements the classic Fasham-type NPZD system with Eppley temperature dependence, Michaelis-Menten nutrient/light limitation, and Ivlev grazing.
+- **Seasonal forcing** → sinusoidal annual cycles for PAR (Photosynthetically Active Radiation) and SST (Sea Surface Temperature) drive the spring bloom dynamics.
+- **Modular pipeline** → each stage (data generation, training, evaluation) can be run independently or skipped via CLI flags.
+- **Autoregressive rollout evaluation** → the core scientific test: the network predicts its own inputs iteratively over a full 365-day cycle.
+- **Nitrogen conservation tracking** → checks whether total nitrogen $N + P + Z + D$ is conserved through the rollout, a key physical constraint.
+- **Selective figure saving** → individual rollout PNGs are saved every 10th trajectory into `figures/rollouts/`; summary statistics use the full evaluation set.
+- **Fully configurable** → all ecological parameters, network hyperparameters, and training settings are centralised in `config.py`.
 
 ---
 
@@ -119,9 +119,9 @@ $$\frac{dN}{dt} = -\mu(N, I, T)\, P + \alpha\, G(P)\, Z + \varepsilon\, P + \var
 
 $$\frac{dP}{dt} = \mu(N, I, T)\, P - G(P)\, Z - \varepsilon\, P$$
 
-$$\frac{dZ}{dt} = \beta\, G(P)\, Z - g\, Z$$
+$$\frac{dZ}{dt} = \beta\, G(P)\, Z - M\, Z$$
 
-$$\frac{dD}{dt} = (1 - \alpha - \beta)\, G(P)\, Z + \varepsilon\, P + g\, Z - \varphi\, D$$
+$$\frac{dD}{dt} = (1 - \alpha - \beta)\, G(P)\, Z + \varepsilon\, P + M\, Z - \varphi\, D$$
 
 where the ecological parameters are:
 
@@ -134,7 +134,7 @@ where the ecological parameters are:
 | Dissolved excretion fraction | $\alpha$ | 0.1 | — | Fraction of grazing excreted back to $N$ |
 | Zooplankton assimilation | $\beta$ | 0.6 | — | Fraction of grazing converted to $Z$ biomass |
 | Phyto excretion/mortality | $\varepsilon$ | 0.05 | d⁻¹ | Phytoplankton loss rate |
-| Zooplankton mortality | $g$ | 0.20 | d⁻¹ | Zooplankton quadratic loss rate |
+| Zooplankton mortality | $M$ | 0.20 | d⁻¹ | Zooplankton quadratic loss rate |
 | Remineralisation | $\varphi$ | 0.10 | d⁻¹ | Detritus decomposition rate |
 
 The ODE system is solved using the adaptive Runge-Kutta RK45 integrator from `scipy.integrate.solve_ivp` [(Virtanen et al., 2020)](#bibliography), with tolerances $r_{\text{tol}} = 10^{-6}$, $a_{\text{tol}} = 10^{-8}$.
