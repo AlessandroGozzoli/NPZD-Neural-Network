@@ -10,41 +10,29 @@ A self-contained Python experiment that trains a feedforward Multi-Layer Percept
 
 ## Table of Contents
 
-1. [Objective](#objective)
-2. [Project Structure](#project-structure)
-3. [Features](#features)
-4. [Theoretical Background](#theoretical-background)
+1. [Project Structure](#project-structure)
+2. [Features](#features)
+3. [Theoretical Background](#theoretical-background)
    - [The NPZD Biogeochemical Model](#the-npzd-biogeochemical-model)
    - [Environmental Forcing](#environmental-forcing)
+   - [Seasonal Nutrient Mixing](#seasonal-nutrient-mixing)
    - [Phytoplankton Growth Rate](#phytoplankton-growth-rate)
    - [Zooplankton Grazing](#zooplankton-grazing)
-   - [Nitrogen Conservation](#nitrogen-conservation)
+   - [Nitrogen Budget](#nitrogen-budget)
    - [Data Generation Strategy](#data-generation-strategy)
    - [Neural Network Architecture](#neural-network-architecture)
    - [Training Objective](#training-objective)
    - [Autoregressive Rollout](#autoregressive-rollout)
-5. [Installation](#installation)
+4. [Installation](#installation)
    - [Without Conda](#without-conda-plain-pip)
    - [With Conda](#with-conda)
-6. [CLI Usage](#cli-usage)
+5. [CLI Usage](#cli-usage)
    - [Arguments](#arguments)
    - [Examples](#examples)
    - [Corner Cases](#corner-cases)
-7. [Outputs](#outputs)
-8. [Configuration Reference](#configuration-reference)
-9. [Bibliography](#bibliography)
-
----
-
-## Objective
-
-Marine biogeochemical models such as the **Biogeochemical Flux Model (BFM)** are essential tools for simulating the cycling of carbon, nitrogen, and other elements through ocean ecosystems. They are however computationally expensive, making them difficult to couple with high-resolution physical ocean models or to run in large ensemble studies.
-
-This repository asks a focused scientific question:
-
-> *Can a simple feedforward neural network learn to emulate the one-step state transitions of an NPZD biogeochemical model, and when chained autoregressively, reproduce the emergent annual cycle, including the spring phytoplankton bloom, without access to the underlying equations?*
-
-The experiment is intentionally scoped for reproducibility on a standard laptop. It serves as a minimal but scientifically grounded proof-of-concept for neural network surrogate modelling of biogeochemical systems, in the spirit of reduced-complexity emulators such as BFM17 [(Smith et al., 2021)](#bibliography).
+6. [Outputs](#outputs)
+7. [Configuration Reference](#configuration-reference)
+8. [Bibliography](#bibliography)
 
 ---
 
@@ -53,7 +41,7 @@ The experiment is intentionally scoped for reproducibility on a standard laptop.
 ```
 npzd_nn_experiment/
 │
-├── config.py             # Central parameter store — all hyperparameters live here
+├── config.py             # Central parameter store, all hyperparameters live here
 ├── npzd_ode.py           # NPZD ODE system, forcing functions, and scipy solver
 ├── data_generator.py     # Monte Carlo ODE runs → supervised training pairs
 ├── dataset.py            # Z-score normalisation, PyTorch Dataset, DataLoaders
@@ -71,7 +59,7 @@ Generated at runtime:
 ```
 data/
 ├── X.npy                 # Input features  (n_samples, 6)
-├── y.npy                 # Target states   (n_samples, 4)
+├── y.npy                 # Target increments (n_samples, 4)
 ├── normaliser.npz        # Fitted Z-score statistics
 └── eval_trajectories.npy # Held-out full trajectories for rollout
 
@@ -80,23 +68,25 @@ checkpoints/
 
 figures/
 ├── loss_curve.png        # Train / val MSE and learning rate history
-├── eval_summary.png      # RMSE boxplots + N conservation histogram
+├── eval_summary.png      # RMSE boxplots + N tracking histogram
 └── rollouts/
-    └── rollout_traj*.png # Per-trajectory autoregressive rollout plots
+    └── rollout_NNN.png   # Per-trajectory autoregressive rollout plots
 ```
 
 ---
 
 ## Features
 
-- **Self-contained data generation** → no external datasets required; all training data is produced by numerically solving the NPZD ODEs across thousands of randomly sampled initial conditions and perturbed ecological parameters.
-- **Physically grounded ODE engine** → implements the classic Fasham-type NPZD system with Eppley temperature dependence, Michaelis-Menten nutrient/light limitation, and Ivlev grazing.
-- **Seasonal forcing** → sinusoidal annual cycles for PAR (Photosynthetically Active Radiation) and SST (Sea Surface Temperature) drive the spring bloom dynamics.
-- **Modular pipeline** → each stage (data generation, training, evaluation) can be run independently or skipped via CLI flags.
-- **Autoregressive rollout evaluation** → the core scientific test: the network predicts its own inputs iteratively over a full 365-day cycle.
-- **Nitrogen conservation tracking** → checks whether total nitrogen $N + P + Z + D$ is conserved through the rollout, a key physical constraint.
-- **Selective figure saving** → individual rollout PNGs are saved every 10th trajectory into `figures/rollouts/`; summary statistics use the full evaluation set.
-- **Fully configurable** → all ecological parameters, network hyperparameters, and training settings are centralised in `config.py`.
+- **Self-contained data generation** — no external datasets required; all training data is produced by numerically solving the NPZD ODEs across thousands of randomly sampled initial conditions and perturbed ecological parameters.
+- **Physically grounded ODE engine** — implements the Fasham-type NPZD system with seasonal nutrient mixing, Eppley temperature dependence, Michaelis-Menten nutrient/light limitation, and Ivlev grazing.
+- **Open-system seasonal dynamics** — winter deep-water mixing supplies inorganic nitrogen from depth, driving the spring phytoplankton bloom naturally from the ODE physics.
+- **Stiff-system solver** — uses the Radau implicit Runge-Kutta solver (order 5, A-stable) with an analytical Jacobian, replacing explicit methods unsuited to the stiff NPZD equations.
+- **Delta formulation** — the network predicts state increments $\Delta\mathbf{s} = \mathbf{s}_{t+1} - \mathbf{s}_t$ rather than absolute next states, producing a smaller learning signal and more stable autoregressive rollouts.
+- **Modular pipeline** — each stage (data generation, training, evaluation) can be run independently or skipped via CLI flags.
+- **Autoregressive rollout evaluation** — the core scientific test: the network predicts its own inputs iteratively over a full 365-day cycle.
+- **Nitrogen tracking** — total nitrogen $N + P + Z + D$ is tracked through the rollout and compared against the ODE ground truth as a physical consistency diagnostic.
+- **Selective figure saving** — individual rollout PNGs are saved every 10th trajectory; summary statistics use the full evaluation set.
+- **Fully configurable** — all ecological parameters, network hyperparameters, and training settings are centralised in `config.py`.
 
 ---
 
@@ -113,31 +103,44 @@ The NPZD model partitions marine nitrogen into four state variables (all in $\te
 | $Z$    | Zooplankton biomass       |
 | $D$    | Particulate detritus      |
 
-The coupled ODE system governing their time evolution is:
+The system is **open**: a seasonal mixing term continuously exchanges nitrogen between the mixed layer and the deep ocean (see [Seasonal Nutrient Mixing](#seasonal-nutrient-mixing)). The coupled ODE system governing time evolution is:
 
-$$\frac{dN}{dt} = -\mu(N, I, T)\, P + \alpha\, G(P)\, Z + \varepsilon\, P + \varphi\, D$$
+$$\frac{dN}{dt} = -\mu(N, I, T)\, P + \alpha\, G(P)\, Z + \varphi\, D + \kappa(t)\left(N_{\text{deep}} - N\right)$$
 
 $$\frac{dP}{dt} = \mu(N, I, T)\, P - G(P)\, Z - \varepsilon\, P$$
 
-$$\frac{dZ}{dt} = \beta\, G(P)\, Z - M\, Z$$
+$$\frac{dZ}{dt} = \beta\, G(P)\, Z - g\, Z$$
 
-$$\frac{dD}{dt} = (1 - \alpha - \beta)\, G(P)\, Z + \varepsilon\, P + M\, Z - \varphi\, D$$
+$$\frac{dD}{dt} = (1 - \alpha - \beta)\, G(P)\, Z + \varepsilon\, P + g\, Z - \varphi\, D$$
 
-where the ecological parameters are:
+The internal nitrogen fluxes between compartments are:
+
+| Flux | Expression | Route |
+|------|------------|-------|
+| Primary production | $\mu P$ | $N \to P$ |
+| Grazing — excretion | $\alpha G(P) Z$ | $P \to N$ |
+| Grazing — assimilation | $\beta G(P) Z$ | $P \to Z$ |
+| Grazing — egestion | $(1-\alpha-\beta) G(P) Z$ | $P \to D$ |
+| Phyto mortality | $\varepsilon P$ | $P \to D$ |
+| Zoo mortality | $g Z$ | $Z \to D$ |
+| Remineralisation | $\varphi D$ | $D \to N$ |
+| Winter mixing | $\kappa(t)(N_{\text{deep}} - N)$ | external $\to N$ |
+
+The ecological parameters and their nominal values are:
 
 | Parameter | Symbol | Nominal Value | Units | Description |
 |-----------|--------|---------------|-------|-------------|
 | Half-saturation (N) | $k_N$ | 0.5 | mmol N m⁻³ | Michaelis-Menten nutrient constant |
 | Half-saturation (I) | $k_I$ | 30.0 | W m⁻² | Michaelis-Menten light constant |
-| Max grazing rate | $R_m$ | 1.0 | d⁻¹ | Ivlev maximum grazing rate |
-| Ivlev constant | $\lambda$ | 0.1 | (mmol N m⁻³)⁻¹ | Grazing saturation constant |
+| Max grazing rate | $R_m$ | 0.8 | d⁻¹ | Ivlev maximum grazing rate |
+| Ivlev constant | $\lambda$ | 0.06 | (mmol N m⁻³)⁻¹ | Grazing saturation constant |
 | Dissolved excretion fraction | $\alpha$ | 0.1 | — | Fraction of grazing excreted back to $N$ |
 | Zooplankton assimilation | $\beta$ | 0.6 | — | Fraction of grazing converted to $Z$ biomass |
-| Phyto excretion/mortality | $\varepsilon$ | 0.05 | d⁻¹ | Phytoplankton loss rate |
-| Zooplankton mortality | $M$ | 0.20 | d⁻¹ | Zooplankton quadratic loss rate |
-| Remineralisation | $\varphi$ | 0.10 | d⁻¹ | Detritus decomposition rate |
+| Phyto mortality | $\varepsilon$ | 0.03 | d⁻¹ | Phytoplankton loss rate to detritus |
+| Zooplankton mortality | $g$ | 0.15 | d⁻¹ | Zooplankton mortality rate |
+| Remineralisation | $\varphi$ | 0.07 | d⁻¹ | Detritus decomposition rate |
 
-The ODE system is solved using the adaptive Runge-Kutta RK45 integrator from `scipy.integrate.solve_ivp` [(Virtanen et al., 2020)](#bibliography), with tolerances $r_{\text{tol}} = 10^{-6}$, $a_{\text{tol}} = 10^{-8}$.
+The ODE system is solved using the **Radau** implicit Runge-Kutta solver (order 5, A-stable) from `scipy.integrate.solve_ivp` [(Virtanen et al., 2020)](#bibliography), with tolerances $r_{\text{tol}} = 10^{-8}$, $a_{\text{tol}} = 10^{-10}$. An analytical Jacobian is provided to the solver, eliminating finite-difference approximation overhead and reducing the number of RHS evaluations per step. Radau is used in preference to explicit methods (such as RK45) because NPZD equations are stiff, they contain widely separated timescales across the four compartments, and explicit solvers are not suited to stiff systems.
 
 ---
 
@@ -149,13 +152,29 @@ Two time-varying external drivers force the system through a sinusoidal annual c
 
 $$I(t) = \bar{I} + A_I \sin\!\left(\frac{2\pi t}{365} - \frac{\pi}{2} + \phi_I\right)$$
 
-with $\bar{I} = 80\,\text{W m}^{-2}$, $A_I = 60\,\text{W m}^{-2}$, $\phi_I = 0$.
+with $\bar{I} = 75\,\text{W m}^{-2}$, $A_I = 55\,\text{W m}^{-2}$, $\phi_I = 0$ (maximum at day $\approx 91$, spring equinox).
 
 **Sea Surface Temperature (SST):**
 
 $$T(t) = \bar{T} + A_T \sin\!\left(\frac{2\pi t}{365} - \frac{\pi}{2} + \phi_T\right)$$
 
 with $\bar{T} = 10\,°\text{C}$, $A_T = 6\,°\text{C}$, $\phi_T = 0.5\,\text{rad}$ (temperature lags light slightly, consistent with observed ocean thermal inertia).
+
+---
+
+### Seasonal Nutrient Mixing
+
+A key feature of the model is the seasonal supply of dissolved inorganic nitrogen from depth, parameterised as a restoring term in $dN/dt$:
+
+$$\text{Mix}(t) = \kappa(t) \cdot \left(N_{\text{deep}} - N\right)$$
+
+$$\kappa(t) = \kappa_{\max} \cdot \max\!\left(0,\; \cos\!\left(\frac{2\pi t}{365}\right)\right)$$
+
+with $\kappa_{\max} = 0.08\,\text{d}^{-1}$ and $N_{\text{deep}} = 8.0\,\text{mmol N m}^{-3}$.
+
+The mixing rate $\kappa(t)$ peaks on January 1 ($t = 0$) and is exactly zero from the spring equinox to the autumn equinox ($t \approx 91$ to $t \approx 274$). This represents the physical process of winter mixed-layer deepening entraining nutrient-rich deep water into the surface layer, the standard mechanism that replenishes inorganic nitrogen and sets the stage for the spring phytoplankton bloom [(Fasham et al., 1990)](#bibliography).
+
+This term makes the system **open**: total nitrogen $N + P + Z + D$ is not conserved over time, as external nitrogen enters the mixed layer in winter and is exported from the surface layer in summer via the sinking of detritus (implicitly, through the structure of the remineralisation term).
 
 ---
 
@@ -179,7 +198,7 @@ Grazing follows the **Ivlev (1955)** saturating functional response [(Ivlev, 195
 
 $$G(P) = R_m \left(1 - e^{-\lambda P}\right)$$
 
-At low prey concentrations this is approximately linear; at high concentrations it saturates at $R_m$. The full grazing flux on the ecosystem is $G(P) \cdot Z$, partitioned as:
+At low prey concentrations this is approximately linear; at high concentrations it saturates at $R_m$. The total grazing flux on the ecosystem is $G(P) \cdot Z$, partitioned as:
 
 - $\alpha \cdot G(P)\,Z$ → dissolved $N$ (excretion)
 - $\beta \cdot G(P)\,Z$ → zooplankton biomass growth
@@ -187,28 +206,28 @@ At low prey concentrations this is approximately linear; at high concentrations 
 
 ---
 
-### Nitrogen Conservation
+### Nitrogen Budget
 
-In a closed system with no physical transport, total nitrogen must be conserved:
+Because the system is open, total nitrogen $\Sigma N = N + P + Z + D$ is not conserved. Instead, $\Sigma N$ increases in winter when $\kappa(t)(N_{\text{deep}} - N) > 0$ and decreases in summer when mixing is absent and biological uptake exceeds supply. The internal fluxes (those not involving the mixing term) do sum to zero, so any change in $\Sigma N$ is attributable entirely to the mixing term.
 
-$$\frac{d}{dt}(N + P + Z + D) = 0 \implies N(t) + P(t) + Z(t) + D(t) = \text{const}$$
-
-This is verified analytically from the ODE structure: every source term in one compartment appears as an equal and opposite sink in another. The conservation error during the autoregressive rollout — $|\sum_i \hat{s}_i(t) - \sum_i s_i(0)|$ — is tracked as a key diagnostic of physical consistency.
+During evaluation, $\Sigma N(t)$ is tracked for both the ODE ground truth and the neural network rollout. A divergence between the two total-nitrogen trajectories indicates that the network has failed to correctly learn the mixing-driven seasonal N supply. This is used as a physical consistency diagnostic alongside per-variable RMSE.
 
 ---
 
 ### Data Generation Strategy
 
-A supervised dataset of one-step transitions is built by:
+A supervised dataset of one-step state increment transitions is built by:
 
-1. Drawing $N_{\text{traj}} = 5000$ random initial conditions $\mathbf{s}_0 = [N_0, P_0, Z_0, D_0]^\top$ from uniform distributions over physically plausible ranges.
-2. Optionally perturbing ecological parameters $\{V_{m,a},\, R_m,\, k_N,\, \varepsilon,\, \varphi\}$ by $\pm 25\%$ around their nominal values, increasing the diversity of the training distribution.
-3. Running the ODE solver for 365 days, producing a daily state trajectory $\{\mathbf{s}_t\}_{t=0}^{364}$.
-4. Extracting all consecutive pairs:
+1. Drawing $N_{\text{traj}} = 5000$ independent initial conditions $\mathbf{s}_0 = [N_0, P_0, Z_0, D_0]^\top$ from winter ranges (high $N$, low biology) to represent the natural start of the annual cycle.
+2. Perturbing ecological parameters $\{V_{m,a},\, R_m,\, k_N,\, \varepsilon,\, \varphi,\, \lambda\}$ by $\pm 20\%$ around their nominal values for each trajectory, increasing the diversity of the training distribution.
+3. Running the Radau ODE solver for 365 days, producing a daily state trajectory $\{\mathbf{s}_t\}_{t=0}^{365}$.
+4. Extracting all consecutive pairs in **delta (increment) formulation**:
 
-$$(\mathbf{x}_t,\, \mathbf{s}_{t+1}) \quad \text{where} \quad \mathbf{x}_t = [N_t,\, P_t,\, Z_t,\, D_t,\, I_t,\, T_t]^\top$$
+$$\mathbf{x}_t = [N_t,\, P_t,\, Z_t,\, D_t,\, I_t,\, T_t]^\top \quad \longrightarrow \quad \Delta\mathbf{s}_t = \mathbf{s}_{t+1} - \mathbf{s}_t$$
 
 yielding $\sim 1.8 \times 10^6$ raw samples, subsampled to $2 \times 10^5$ for training efficiency.
+
+The delta formulation means the network learns small, smooth corrections at each timestep rather than absolute state values. The learning signal is smaller in magnitude, the per-variable distributions are centred near zero, and rollout stability is improved because errors accumulate as additive corrections rather than multiplicative deviations.
 
 ---
 
@@ -217,17 +236,18 @@ yielding $\sim 1.8 \times 10^6$ raw samples, subsampled to $2 \times 10^5$ for t
 The model is a fully-connected feedforward MLP [(Paszke et al., 2019)](#bibliography):
 
 ```
-Input   (6)  →  Linear(6→128)  →  ReLU
-             →  Linear(128→128) →  ReLU
-             →  Linear(128→64)  →  ReLU
-             →  Linear(64→4)   [linear output]
+Input   (6)  →  Linear(6→128)   →  ReLU
+             →  Linear(128→128)  →  ReLU
+             →  Linear(128→64)   →  ReLU
+             →  Linear(64→4)    [linear output]
 Output  (4)
 ```
 
+- **Input:** $[N_t,\, P_t,\, Z_t,\, D_t,\, I_t,\, T_t]$ (current state + forcing, Z-score normalised)
+- **Output:** $[\Delta N,\, \Delta P,\, \Delta Z,\, \Delta D]$ (normalised state increments)
 - **Activation:** ReLU on all hidden layers; linear output for regression.
-- **Weight initialisation:** Kaiming normal [(He et al., 2015)](#bibliography), appropriate for ReLU networks and ensuring well-scaled gradients at initialisation.
-- **Non-negativity:** Predictions are clamped to $[0, \infty)$ after inverse normalisation during rollout, enforcing the physical constraint that concentrations cannot be negative.
-- **Total parameters:** $128 \times 7 + 128^2 + 128 \times 64 + 64 \times 4 \approx 26{,}500$ trainable parameters.
+- **Weight initialisation:** Kaiming normal [(He et al., 2015)](#bibliography), appropriate for ReLU networks.
+- **Total parameters:** $\approx 26{,}500$ trainable parameters.
 
 ---
 
@@ -237,21 +257,23 @@ All inputs and outputs are Z-score normalised using statistics fit on the traini
 
 $$\hat{x} = \frac{x - \mu_{\text{train}}}{\sigma_{\text{train}}}$$
 
-The loss function is the **Mean Squared Error** on normalised targets:
+The loss function is the **Mean Squared Error** on normalised target increments:
 
-$$\mathcal{L} = \frac{1}{N} \sum_{i=1}^{N} \left\| f_\theta(\hat{\mathbf{x}}_i) - \hat{\mathbf{s}}_{i+1} \right\|_2^2$$
+$$\mathcal{L} = \frac{1}{N} \sum_{i=1}^{N} \left\| f_\theta(\hat{\mathbf{x}}_i) - \widehat{\Delta\mathbf{s}}_i \right\|_2^2$$
 
 Optimisation uses **Adam** [(Kingma & Ba, 2015)](#bibliography) with learning rate $\eta = 10^{-3}$, weight decay $\lambda_{L2} = 10^{-5}$, and a `ReduceLROnPlateau` scheduler (patience 10, factor 0.5). Training is stopped early after 25 epochs without validation improvement.
+
+**Input noise injection:** Small Gaussian noise ($\sigma = 0.005$, normalised units) is applied to the four state inputs $[N, P, Z, D]$ during training only. This prevents the network from memorising the exact training distribution and discourages convergence to spurious attractor states. Noise is not applied to the forcing inputs $[I, T]$, which are deterministic functions of time.
 
 ---
 
 ### Autoregressive Rollout
 
-The rollout is the primary scientific evaluation. Given only the initial state $\mathbf{s}_0$ of a held-out trajectory, the network predicts forward iteratively:
+The rollout is the primary scientific evaluation. Given only the initial state $\mathbf{s}_0$ of a held-out trajectory, the network predicts forward iteratively using the **delta formulation**:
 
-$$\hat{\mathbf{s}}_{t+1} = \max\!\left(0,\; f_\theta^{-1}\!\left(f_\theta\!\left(\hat{\mathbf{x}}_t\right)\right)\right), \quad \hat{\mathbf{x}}_t = [\hat{\mathbf{s}}_t,\, I_t,\, T_t]^\top$$
+$$\hat{\mathbf{s}}_{t+1} = \max\!\left(0,\; \hat{\mathbf{s}}_t + f_\theta^{-1}\!\left(f_\theta\!\left(\hat{\mathbf{x}}_t\right)\right)\right), \quad \hat{\mathbf{x}}_t = [\hat{\mathbf{s}}_t,\, I_t,\, T_t]^\top$$
 
-where $f_\theta^{-1}$ denotes inverse normalisation. The rollout is compared to the ODE ground truth over 365 days using per-variable RMSE and nitrogen conservation error.
+where $f_\theta^{-1}$ denotes inverse normalisation of the predicted increment, and the $\max(0, \cdot)$ clamp enforces non-negativity of all concentrations. The rollout is compared to the ODE ground truth over 365 days using per-variable RMSE and total-nitrogen tracking.
 
 ---
 
@@ -295,7 +317,7 @@ conda install pytorch cpuonly -c pytorch -y
 pip install -r requirements.txt
 ```
 
-> **GPU note:** The experiment runs comfortably on CPU. If a CUDA-enabled GPU is available, PyTorch will use it automatically — no code changes required. Replace the conda PyTorch install with the appropriate CUDA build from [pytorch.org](https://pytorch.org/get-started/locally/).
+> **GPU note:** The experiment runs comfortably on CPU. If a CUDA-enabled GPU is available, PyTorch will use it automatically, no code changes required. Replace the conda PyTorch install with the appropriate CUDA build from [pytorch.org](https://pytorch.org/get-started/locally/).
 
 ---
 
@@ -311,14 +333,14 @@ All stages are orchestrated through `main.py`.
 | `--skip-train` | flag | off | Skip training; load existing checkpoint from `checkpoints/best_model.pt` |
 | `--skip-eval` | flag | off | Skip the autoregressive rollout evaluation |
 | `--n-traj` | int | `config.DATA_GEN["n_trajectories"]` (5000) | Override number of Monte Carlo ODE trajectories to generate |
-| `--n-eval` | int | `config.EVAL["n_rollout_trajectories"]` (200) | Override number of rollout trajectories to evaluate |
+| `--n-eval` | int | `config.EVAL["n_rollout_plots"]` (200) | Override number of rollout trajectories to evaluate |
 | `--epochs` | int | `config.TRAIN["max_epochs"]` (200) | Override maximum number of training epochs |
 
 ---
 
 ### Examples
 
-**1. Full pipeline with default settings (~30–60 min on CPU)**
+**1. Full pipeline with default settings**
 ```bash
 python main.py
 ```
@@ -366,10 +388,10 @@ ERROR: Checkpoint not found: checkpoints/best_model.pt
 A checkpoint is only created during training. Run without `--skip-train` at least once.
 
 **Setting `--n-eval` larger than the number of saved eval trajectories:**
-The evaluator will silently cap at the number of available trajectories (`min(n_eval, len(trajectories))`). To increase the pool, raise `n_trajectories` in the `generate_trajectories_for_eval()` call inside `main.py` (default: 200).
+The evaluator will silently cap at the number of available trajectories (`min(n_eval, len(trajectories))`). To increase the pool, raise `n_eval_trajectories` in `config.EVAL` (default: 200).
 
 **Requesting more rollout figures than trajectories evaluated:**
-Individual rollout PNGs are saved every 10th trajectory (`traj_id % 10 == 0`). With `--n-eval 200` you get 20 figures. With `--n-eval 50` you get 5. The summary plot always uses the full evaluated set regardless.
+Individual rollout PNGs are saved every 10th trajectory (`rank % 10 == 0`). With `--n-eval 200` you get 20 figures. With `--n-eval 50` you get 5. The summary plot always uses the full evaluated set regardless.
 
 **Modifying `config.py` mid-run:**
 Each stage reads from `config.py` at import time. If you change parameters between `--skip-datagen` and training, the training data and the new config may be inconsistent. It is safest to either run the full pipeline or regenerate data explicitly after any config change.
@@ -381,13 +403,13 @@ Each stage reads from `config.py` at import time. If you change parameters betwe
 | Path | Description |
 |---|---|
 | `data/X.npy` | Input features array, shape `(n_samples, 6)` |
-| `data/y.npy` | Target array, shape `(n_samples, 4)` |
+| `data/y.npy` | Target increments array, shape `(n_samples, 4)` — values are $\Delta s = s_{t+1} - s_t$ |
 | `data/normaliser.npz` | Z-score mean and std for inputs and targets |
 | `data/eval_trajectories.npy` | List of complete held-out ODE trajectories |
 | `checkpoints/best_model.pt` | PyTorch checkpoint of the best model (lowest val MSE) |
 | `figures/loss_curve.png` | Training / validation MSE and learning rate curves |
-| `figures/eval_summary.png` | Boxplot of per-variable RMSE + N conservation histogram |
-| `figures/rollouts/rollout_trajNNN.png` | Rollout comparison plots (every 10th trajectory) |
+| `figures/eval_summary.png` | Boxplot of per-variable RMSE + total-N tracking histogram |
+| `figures/rollouts/rollout_NNN.png` | Rollout comparison plots (every 10th trajectory) |
 
 ---
 
@@ -396,25 +418,33 @@ Each stage reads from `config.py` at import time. If you change parameters betwe
 All parameters live in `config.py`. The most commonly tuned entries are:
 
 ```python
+FORCING = {
+    "kappa_max" : 0.08,   # [d⁻¹]        peak winter mixing rate (↑ = stronger bloom)
+    "N_deep"    : 8.0,    # [mmol N m⁻³] deep water nutrient concentration
+}
+
 DATA_GEN = {
-    "n_trajectories"     : 5000,    # ↑ for more training data, ↓ for speed
-    "param_perturb_frac" : 0.25,    # 0.0 = fixed params; higher = more diversity
-    "max_samples"        : 200_000, # Cap on one-step pairs kept for training
+    "n_trajectories"      : 5000,    # ↑ for more training data, ↓ for speed
+    "param_perturb_frac"  : 0.20,    # 0.0 = fixed params; higher = more diversity
+    "max_samples"         : 200_000, # Cap on one-step pairs kept for training
 }
 
 MODEL = {
-    "hidden_dims" : [128, 128, 64], # Change to vary network depth/width
+    "hidden_dims" : [128, 128, 64],  # Change to vary network depth/width
+    "dropout_p"   : 0.0,             # Enable dropout regularisation (e.g. 0.1)
 }
 
 TRAIN = {
     "max_epochs"          : 200,
     "learning_rate"       : 1e-3,
     "early_stop_patience" : 25,
+    "input_noise_std"     : 0.005,   # State input noise during training (0.0 = off)
 }
 
 EVAL = {
-    "n_rollout_trajectories" : 200,  # Total rollouts computed
-    "figures_dir"            : "figures",
+    "n_eval_trajectories" : 200,     # Total held-out trajectories generated
+    "n_rollout_plots"     : 200,     # How many rollouts to compute and summarise
+    "figures_dir"         : "figures",
 }
 ```
 
