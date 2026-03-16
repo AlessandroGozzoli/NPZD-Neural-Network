@@ -1,151 +1,173 @@
 # =============================================================================
-# config.py
-# Central configuration file for the NPZD Neural Network Experiment.
-# All parameters are defined here. Import this module everywhere else.
+# config.py  —  Central parameter store.
+# Every number in the project lives here. Import from this file everywhere.
 # =============================================================================
 
-import numpy as np
-
 # -----------------------------------------------------------------------------
-# NPZD ODE — Ecological Parameters (nominal values)
+# NPZD ecological parameters  (nominal / mean values)
 # -----------------------------------------------------------------------------
 ODE_PARAMS = {
-    # Phytoplankton growth
-    "Vm_a"  : 0.6,    # [d^-1] Max growth rate coefficient
-    "Vm_b"  : 1.066,  # [-]    Temperature factor base (doubling ~10°C)
-    "kN"    : 0.5,    # [mmol N m^-3] Half-saturation for nutrient uptake
-    "kI"    : 30.0,   # [W m^-2]      Half-saturation for light
+    # Phytoplankton growth  (Eppley 1972 temperature function)
+    "Vm_a" : 0.6,    # [d⁻¹]  max growth rate coefficient
+    "Vm_b" : 1.066,  # [—]    temperature base (≈ doubling per 10 °C)
+    "kN"   : 0.5,    # [mmol N m⁻³]  Michaelis-Menten half-sat. for N
+    "kI"   : 30.0,   # [W m⁻²]       Michaelis-Menten half-sat. for light
 
-    # Zooplankton grazing
-    "Rm"    : 1.0,    # [d^-1]              Max grazing rate
-    "lam"   : 0.1,    # [(mmol N m^-3)^-1]  Ivlev grazing constant
+    # Zooplankton grazing  (Ivlev 1955)
+    "Rm"   : 0.8,    # [d⁻¹]                   max grazing rate
+    "lam"  : 0.06,   # [(mmol N m⁻³)⁻¹]        Ivlev saturation constant
 
-    # Partitioning of grazing products
-    "alpha" : 0.1,    # [-] Fraction of grazing excreted as dissolved N (back to N)
-    "beta"  : 0.6,    # [-] Fraction of grazing assimilated into zooplankton biomass
-    # (1 - alpha - beta) => 0.3 goes to detritus
+    # Grazing partitioning  (must satisfy: alpha + beta < 1)
+    "alpha": 0.10,   # [—]  fraction excreted back to dissolved N
+    "beta" : 0.60,   # [—]  fraction assimilated into zooplankton biomass
+    # Remainder (1 - alpha - beta) = 0.30  →  detritus (egestion)
 
     # Loss rates
-    "eps"   : 0.05,   # [d^-1] Phytoplankton excretion/mortality rate
-    "g"     : 0.20,   # [d^-1] Zooplankton mortality rate
-    "phi"   : 0.10,   # [d^-1] Detritus remineralization rate
+    "eps"  : 0.03,   # [d⁻¹]  phytoplankton specific mortality/excretion
+    "g"    : 0.15,   # [d⁻¹]  zooplankton specific mortality
+    "phi"  : 0.07,   # [d⁻¹]  detritus remineralisation rate
 }
 
 # -----------------------------------------------------------------------------
-# Environmental Forcing — Seasonal Cycle
+# Environmental forcing — sinusoidal annual cycle
 # -----------------------------------------------------------------------------
 FORCING = {
-    # PAR (Photosynthetically Active Radiation) — sinusoidal annual cycle
-    "I_mean"  : 80.0,   # [W m^-2] Annual mean PAR
-    "I_amp"   : 60.0,   # [W m^-2] Seasonal amplitude
-    "I_phase" : 0.0,    # [rad]    Phase offset (0 = max at day 91, ~spring equinox)
+    # PAR (Photosynthetically Active Radiation)
+    "I_mean"  : 75.0,   # [W m⁻²]  annual mean
+    "I_amp"   : 55.0,   # [W m⁻²]  seasonal amplitude
+    "I_phase" : 0.0,    # [rad]     0 → max at day ~91 (spring equinox)
 
-    # Sea Surface Temperature — sinusoidal annual cycle
-    "T_mean"  : 10.0,   # [°C] Annual mean SST
-    "T_amp"   :  6.0,   # [°C] Seasonal amplitude
-    "T_phase" : 0.5,    # [rad] Phase offset (temperature lags light slightly)
+    # Sea Surface Temperature
+    "T_mean"  : 10.0,   # [°C]   annual mean
+    "T_amp"   :  6.0,   # [°C]   seasonal amplitude
+    "T_phase" :  0.5,   # [rad]  slight lag vs. light (ocean thermal inertia)
+
+    # Seasonal nutrient supply via winter deep-water mixing.
+    # This is the standard mechanism that drives the spring bloom in
+    # 0D NPZD models (Fasham et al. 1990). Without it, inorganic nitrogen
+    # is permanently depleted and the system collapses to a dead attractor.
+    #
+    # Physics: in winter, the mixed layer deepens and entrains nutrient-rich
+    # deep water. We parameterise this as a restoring term in dN/dt:
+    #   dN/dt += kappa(t) * (N_deep - N)
+    # where kappa(t) = kappa_max * max(0, cos(2π*t/365))
+    # which peaks on Jan 1 and is zero from spring equinox to autumn equinox.
+    #
+    # Note: this makes the system OPEN — total N is not conserved.
+    "kappa_max" : 0.08,   # [d⁻¹]        max winter mixing rate
+    "N_deep"    : 8.0,    # [mmol N m⁻³] deep water N concentration
 }
 
 # -----------------------------------------------------------------------------
-# ODE Solver Settings
+# ODE solver  —  Radau (implicit, order 5, A-stable; designed for stiff ODEs)
 # -----------------------------------------------------------------------------
 SOLVER = {
-    "t_start"   : 0,     # [days]
-    "t_end"     : 365,   # [days] One full year
-    "n_steps"   : 365,   # Number of daily output points
-    "method"    : "RK45",
-    "rtol"      : 1e-6,
-    "atol"      : 1e-8,
+    "method"      : "Radau",
+    "t_start"     : 0,
+    "t_end"       : 365,
+    "n_steps"     : 366,     # daily snapshots: t = 0, 1, …, 365
+    "rtol"        : 1e-8,
+    "atol"        : 1e-10,
+    # No spin-up: initial conditions represent winter (high N, low biology),
+    # which is the natural starting state. Spin-up drove the system to a
+    # degenerate nutrient-depleted fixed point.
+    "spinup_days" : 0,
 }
 
 # -----------------------------------------------------------------------------
-# Data Generation — Monte Carlo Sampling
+# Data generation — Monte Carlo
 # -----------------------------------------------------------------------------
 DATA_GEN = {
-    "n_trajectories"    : 5000,   # Number of ODE runs (trajectories)
-    "random_seed"       : 42,
+    "n_trajectories"      : 5000,
+    "random_seed"         : 42,
 
-    # Initial condition sampling ranges [min, max] in mmol N m^-3
-    "N0_range"  : (0.5,  10.0),
-    "P0_range"  : (0.05,  3.0),
-    "Z0_range"  : (0.02,  1.5),
-    "D0_range"  : (0.0,   2.0),
+    # Winter initial conditions: high inorganic N, low biology.
+    # The bloom emerges naturally from these conditions as light increases.
+    # Each variable is sampled independently (system is open, so no N budget
+    # constraint is needed).
+    "N0_range" : (4.0, 12.0),   # [mmol N m⁻³]  high winter nutrients
+    "P0_range" : (0.01, 0.3),   # [mmol N m⁻³]  low winter phytoplankton
+    "Z0_range" : (0.01, 0.15),  # [mmol N m⁻³]  low winter zooplankton
+    "D0_range" : (0.01, 0.5),   # [mmol N m⁻³]  modest detritus
 
-    # Parameter perturbation: fraction of nominal value (+/- this fraction)
-    # Set to 0.0 to keep parameters fixed across all trajectories
-    "param_perturb_frac": 0.25,
+    # Ecological parameter perturbation (±frac around nominal values)
+    "param_perturb_frac" : 0.20,
+    "perturb_params"     : ["Vm_a", "Rm", "kN", "eps", "phi", "lam"],
 
-    # Which parameters to perturb (subset of ODE_PARAMS keys)
-    "perturb_params": ["Vm_a", "Rm", "kN", "eps", "phi"],
+    # Cap on one-step pairs kept for training
+    "max_samples"         : 200_000,
 
-    # Max samples to keep after extracting all one-step pairs
-    "max_samples": 200_000,
+    # Post-solve quality filters
+    "max_N_drift_frac"    : 0.50,   # generous: system is open, some drift expected
+    "min_state_value"     : -1e-6,
+    "max_concentration"   : 40.0,
 
-    # Output file paths
+    # Paths
     "data_dir"  : "data",
     "X_file"    : "data/X.npy",
     "y_file"    : "data/y.npy",
 }
 
 # -----------------------------------------------------------------------------
-# Dataset / Normalisation
+# Dataset / normalisation
 # -----------------------------------------------------------------------------
 DATASET = {
-    # Fraction of trajectories for each split (split at trajectory level)
-    "train_frac" : 0.70,
-    "val_frac"   : 0.15,
-    "test_frac"  : 0.15,
-
-    # Input feature names (for logging/plotting)
+    "train_frac"    : 0.70,
+    "val_frac"      : 0.15,
+    "test_frac"     : 0.15,
     "feature_names" : ["N", "P", "Z", "D", "I", "T"],
-    # Output target names
-    "target_names"  : ["N", "P", "Z", "D"],
+    # Targets are STATE INCREMENTS  Δs = s_{t+1} − s_t
+    "target_names"  : ["ΔN", "ΔP", "ΔZ", "ΔD"],
 }
 
 # -----------------------------------------------------------------------------
-# Neural Network Architecture
+# Neural network  —  delta (increment) formulation
+# The NN predicts Δs = s_{t+1} − s_t rather than s_{t+1} directly.
+# Benefits: smaller signal to learn, simpler conservation constraint
+# (sum(Δs) ≈ 0), better rollout stability.
 # -----------------------------------------------------------------------------
 MODEL = {
-    "input_dim"   : 6,          # N, P, Z, D, I (light), T (temperature)
-    "output_dim"  : 4,          # N, P, Z, D at next timestep
-    "hidden_dims" : [128, 128, 64],  # Neurons per hidden layer
-    "activation"  : "relu",
-    # Enforce non-negativity of outputs (concentrations >= 0)
-    "output_clamp": True,
-    "clamp_min"   : 0.0,
+    "input_dim"   : 6,
+    "output_dim"  : 4,
+    "hidden_dims" : [128, 128, 64],
+    "dropout_p"   : 0.0,
 }
 
 # -----------------------------------------------------------------------------
 # Training
 # -----------------------------------------------------------------------------
 TRAIN = {
-    "batch_size"    : 512,
-    "max_epochs"    : 200,
-    "learning_rate" : 1e-3,
-    "weight_decay"  : 1e-5,     # L2 regularisation
+    "batch_size"          : 512,
+    "max_epochs"          : 200,
+    "learning_rate"       : 1e-3,
+    "weight_decay"        : 1e-5,
 
-    # ReduceLROnPlateau scheduler
-    "lr_patience"   : 10,
-    "lr_factor"     : 0.5,
-    "lr_min"        : 1e-6,
+    "lr_patience"         : 10,
+    "lr_factor"           : 0.5,
+    "lr_min"              : 1e-6,
 
-    # Early stopping
     "early_stop_patience" : 25,
 
-    # Checkpoint
-    "checkpoint_dir": "checkpoints",
-    "best_model_file": "checkpoints/best_model.pt",
+    # Conservation loss is DISABLED: the system is open (seasonal mixing adds
+    # external N), so sum(Δs) ≠ 0 by design. A conservation penalty would
+    # incorrectly punish the network for learning the mixing signal.
+    "conservation_weight" : 0.0,
 
-    # Logging
-    "log_every_n_epochs": 5,
+    # Small Gaussian noise on state inputs [N,P,Z,D] during training only.
+    "input_noise_std"     : 0.005,
 
-    "random_seed"   : 0,
+    "checkpoint_dir"      : "checkpoints",
+    "best_model_file"     : "checkpoints/best_model.pt",
+    "log_every_n_epochs"  : 5,
+    "random_seed"         : 0,
 }
 
 # -----------------------------------------------------------------------------
 # Evaluation
 # -----------------------------------------------------------------------------
 EVAL = {
-    "n_rollout_trajectories" : 100,   # How many held-out trajectories to roll out
-    "figures_dir"            : "figures",
+    "n_eval_trajectories" : 200,
+    "n_rollout_plots"     : 200,
+    "figures_dir"         : "figures",
+    "eval_traj_file"      : "data/eval_trajectories.npy",
 }

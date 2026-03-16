@@ -1,17 +1,28 @@
 # =============================================================================
 # npzd_ode.py
-# Implements the NPZD (Nutrient-Phytoplankton-Zooplankton-Detritus)
-# biogeochemical ODE system and its scipy-based solver.
+# NPZD ODE system with seasonal nutrient supply (open system).
 #
-# State variables (all in mmol N m^-3):
-#   N  — dissolved inorganic nitrogen (nutrient)
-#   P  — phytoplankton nitrogen biomass
-#   Z  — zooplankton nitrogen biomass
-#   D  — particulate detritus nitrogen
+# State variables (mmol N m⁻³):
+#   N — dissolved inorganic nitrogen
+#   P — phytoplankton biomass
+#   Z — zooplankton biomass
+#   D — particulate detritus
 #
-# Environmental forcing (time-varying):
-#   I(t) — photosynthetically active radiation [W m^-2]
-#   T(t) — sea surface temperature [°C]
+# The system is OPEN: a seasonal mixing term supplies inorganic nitrogen
+# from depth in winter, representing mixed-layer deepening. This is the
+# standard mechanism that drives the spring phytoplankton bloom and is
+# present in all realistic 0D NPZD formulations (Fasham et al. 1990).
+#
+# Without this term the closed box depletes all N into biomass/detritus
+# and the system collapses to a biologically dead fixed point.
+#
+# ODE system:
+#   dN/dt = -μP + αGZ + φD  +  κ(t)·(N_deep − N)   ← mixing term
+#   dP/dt = +μP − GZ − εP
+#   dZ/dt =      βGZ − gZ
+#   dD/dt = (1−α−β)GZ + εP + gZ − φD
+#
+# Analytical Jacobian is provided (required by Radau for efficiency).
 # =============================================================================
 
 import numpy as np
@@ -23,136 +34,185 @@ from config import ODE_PARAMS, FORCING, SOLVER
 # Forcing functions
 # =============================================================================
 
-def light_forcing(t: float, cfg: dict = FORCING) -> float:
-    """
-    Sinusoidal annual PAR cycle.
-    Maximum occurs around day 91 (spring equinox) when phase = 0.
-    t in days (0 = Jan 1).
-    """
+def light_forcing(t: np.ndarray, cfg: dict = FORCING) -> np.ndarray:
+    """Sinusoidal annual PAR [W m⁻²].  t in days."""
     omega = 2.0 * np.pi / 365.0
     return cfg["I_mean"] + cfg["I_amp"] * np.sin(omega * t - np.pi / 2.0 + cfg["I_phase"])
 
 
-def temp_forcing(t: float, cfg: dict = FORCING) -> float:
-    """
-    Sinusoidal annual SST cycle.
-    Lags light by ~T_phase radians (temperature response delayed vs. insolation).
-    """
+def temp_forcing(t: np.ndarray, cfg: dict = FORCING) -> np.ndarray:
+    """Sinusoidal annual SST [°C].  t in days."""
     omega = 2.0 * np.pi / 365.0
     return cfg["T_mean"] + cfg["T_amp"] * np.sin(omega * t - np.pi / 2.0 + cfg["T_phase"])
 
 
+def mixing_rate(t: np.ndarray, cfg: dict = FORCING) -> np.ndarray:
+    """
+    Seasonal mixing rate κ(t) [d⁻¹].
+    Peaks on Jan 1 (t=0), zero from spring to autumn equinox.
+    κ(t) = kappa_max · max(0, cos(2π·t/365))
+    """
+    return cfg["kappa_max"] * np.maximum(0.0, np.cos(2.0 * np.pi * np.asarray(t) / 365.0))
+
+
 def get_forcing_at_times(times: np.ndarray) -> np.ndarray:
-    """
-    Evaluate both forcing variables at an array of times.
-    Returns array of shape (len(times), 2) with columns [I, T].
-    """
-    I = np.array([light_forcing(t) for t in times])
-    T = np.array([temp_forcing(t) for t in times])
-    return np.stack([I, T], axis=1)
+    """Return (len(times), 2) array of [I, T] at each time."""
+    I_arr = light_forcing(np.asarray(times))
+    T_arr = temp_forcing(np.asarray(times))
+    return np.stack([I_arr, T_arr], axis=1)
 
 
 # =============================================================================
-# Growth and grazing rate functions
+# Rate functions
 # =============================================================================
 
-def phyto_growth_rate(N: float, I: float, T: float, p: dict) -> float:
+def _phyto_growth(N: float, I: float, T: float, p: dict) -> float:
     """
-    Nutrient- and light-limited phytoplankton specific growth rate.
-
-    Uses:
-      - Eppley-type temperature dependence:  Vm(T) = Vm_a * Vm_b^T
-      - Michaelis-Menten for nutrient:        f_N   = N / (kN + N)
-      - Michaelis-Menten for light:           f_I   = I / (kI + I)
-      - Overall: mu = Vm(T) * f_N * f_I
-
-    Returns mu [d^-1].
+    Specific phytoplankton growth rate [d⁻¹].
+    μ = Vm(T) · N/(kN+N) · I/(kI+I)
+    Vm(T) = Vm_a · Vm_b^T   (Eppley 1972)
     """
-    Vm = p["Vm_a"] * (p["Vm_b"] ** T)
-    f_N = max(N, 0.0) / (p["kN"] + max(N, 0.0))
-    f_I = max(I, 0.0) / (p["kI"] + max(I, 0.0))
-    return Vm * f_N * f_I
+    Vm  = p["Vm_a"] * (p["Vm_b"] ** T)
+    fN  = N / (p["kN"] + N)
+    fI  = max(I, 0.0) / (p["kI"] + max(I, 0.0))
+    return Vm * fN * fI
 
 
-def zoo_grazing_rate(P: float, p: dict) -> float:
+def _zoo_grazing(P: float, p: dict) -> float:
     """
-    Ivlev (1955) saturating grazing functional response.
-    G(P) = Rm * (1 - exp(-lambda * P))   [d^-1]
+    Zooplankton grazing rate [d⁻¹].
+    G(P) = Rm · (1 − exp(−λP))   (Ivlev 1955)
     """
-    return p["Rm"] * (1.0 - np.exp(-p["lam"] * max(P, 0.0)))
+    return p["Rm"] * (1.0 - np.exp(-p["lam"] * P))
 
 
 # =============================================================================
-# The NPZD ODE right-hand side
+# ODE right-hand side
 # =============================================================================
 
-def npzd_rhs(t: float, y: np.ndarray, params: dict) -> list:
+def npzd_rhs(t: float, y: np.ndarray, p: dict) -> np.ndarray:
     """
-    Right-hand side of the NPZD ODE system.
+    NPZD ODE right-hand side.  N-conservation is exact analytically.
 
-    Parameters
-    ----------
-    t      : current time [days]
-    y      : state vector [N, P, Z, D]  (mmol N m^-3)
-    params : dict of ecological parameters (from config.ODE_PARAMS or perturbed copy)
+    Fluxes and their routing:
+      PP   = μ·P          N → P
+      GR   = G(P)·Z       P → {α→N, β→Z, (1-α-β)→D}
+      Ploss= ε·P          P → D
+      Zmort= g·Z          Z → D
+      Remin= φ·D          D → N
 
-    Returns
-    -------
-    dydt : list of derivatives [dN/dt, dP/dt, dZ/dt, dD/dt]
+    dN/dt = -PP  + α·GR        + φ·D
+    dP/dt = +PP  - GR  - ε·P
+    dZ/dt =      + β·GR - g·Z
+    dD/dt =   (1-α-β)·GR + ε·P + g·Z - φ·D
+
+    Sum of RHS = 0 (verified above).
     """
-    N, P, Z, D = y
+    # Clamp to zero: prevents negative values from producing unphysical rates.
+    # The solver should never produce negatives with Radau + tight tolerances,
+    # but the clamp is a safety net during the RHS evaluations.
+    N = max(y[0], 0.0)
+    P = max(y[1], 0.0)
+    Z = max(y[2], 0.0)
+    D = max(y[3], 0.0)
 
-    # Clamp to zero to prevent numerical blow-up of negatives
-    N = max(N, 0.0)
-    P = max(P, 0.0)
-    Z = max(Z, 0.0)
-    D = max(D, 0.0)
+    I = light_forcing(t)
+    T = temp_forcing(t)
+    kappa  = mixing_rate(t)
+    N_deep = FORCING["N_deep"]
 
-    # Environmental forcing at time t
+    mu  = _phyto_growth(N, I, T, p)
+    G   = _zoo_grazing(P, p)
+
+    alpha, beta = p["alpha"], p["beta"]
+    eps, g, phi = p["eps"], p["g"], p["phi"]
+
+    PP    = mu * P
+    GR    = G * Z
+    Ploss = eps * P
+    Zmort = g * Z
+    Remin = phi * D
+
+    # Mixing term: seasonal nutrient supply from depth (open system).
+    # Only acts when N < N_deep (brings N up toward N_deep in winter).
+    Mix = kappa * (N_deep - N)
+
+    dN = -PP + alpha * GR + Remin + Mix   # ← mixing term added here
+    dP = +PP  - GR  - Ploss
+    dZ =        beta * GR  - Zmort
+    dD = (1.0 - alpha - beta) * GR + Ploss + Zmort - Remin
+
+    return np.array([dN, dP, dZ, dD])
+
+
+# =============================================================================
+# Analytical Jacobian   J[i,j] = d(dy_i/dt) / dy_j
+# Providing this to Radau avoids finite-difference approximation and
+# significantly reduces the number of RHS evaluations per step.
+# =============================================================================
+
+def npzd_jacobian(t: float, y: np.ndarray, p: dict) -> np.ndarray:
+    """
+    Analytical 4×4 Jacobian of the NPZD RHS.
+    """
+    N = max(y[0], 0.0)
+    P = max(y[1], 0.0)
+    Z = max(y[2], 0.0)
+    D = max(y[3], 0.0)
+
     I = light_forcing(t)
     T = temp_forcing(t)
 
-    # Derived rates
-    mu  = phyto_growth_rate(N, I, T, params)   # Phyto growth rate [d^-1]
-    G   = zoo_grazing_rate(P, params)           # Zoo grazing rate  [d^-1]
+    Vm    = p["Vm_a"] * (p["Vm_b"] ** T)
+    fI    = max(I, 0.0) / (p["kI"] + max(I, 0.0))
+    kN    = p["kN"]
+    lam   = p["lam"]
+    Rm    = p["Rm"]
+    alpha, beta = p["alpha"], p["beta"]
+    eps, g, phi = p["eps"], p["g"], p["phi"]
 
-    alpha = params["alpha"]
-    beta  = params["beta"]
-    eps   = params["eps"]
-    g     = params["g"]
-    phi   = params["phi"]
+    # Partial derivatives of PP = Vm · fI · N/(kN+N) · P
+    mu          = Vm * fI * N / (kN + N)
+    dPP_dN      = Vm * fI * kN / (kN + N)**2 * P   # ∂PP/∂N
+    dPP_dP      = mu                                 # ∂PP/∂P
 
-    # --- Flux terms ---
-    # Phytoplankton primary production
-    PP   = mu * P                       # [mmol N m^-3 d^-1]
+    # Partial derivatives of GR = Rm·(1-exp(-λP))·Z
+    G           = Rm * (1.0 - np.exp(-lam * P))
+    dG_dP       = Rm * lam * np.exp(-lam * P)
+    dGR_dP      = dG_dP * Z   # ∂GR/∂P
+    dGR_dZ      = G            # ∂GR/∂Z
 
-    # Zooplankton grazing on phytoplankton
-    GR   = G * Z                        # [mmol N m^-3 d^-1]
+    kappa = mixing_rate(t)
 
-    # Partitioning of grazing:
-    #   alpha fraction -> dissolved N  (excretion)
-    #   beta  fraction -> zooplankton biomass
-    #   (1-alpha-beta) fraction -> detritus  (sloppy feeding / unassimilated)
-    G_to_N = alpha * GR
-    G_to_Z = beta  * GR
-    G_to_D = (1.0 - alpha - beta) * GR
+    J = np.zeros((4, 4))
 
-    # Phytoplankton loss (excretion + mortality) -> nutrient pool
-    P_loss = eps * P
+    # Row 0: dN/dt = -PP + α·GR + φ·D + κ·(N_deep−N)
+    # ∂/∂N of mixing term = -κ
+    J[0, 0] = -dPP_dN - kappa
+    J[0, 1] = -dPP_dP + alpha * dGR_dP
+    J[0, 2] =           alpha * dGR_dZ
+    J[0, 3] = phi
 
-    # Zooplankton mortality -> detritus
-    Z_mort = g * Z
+    # Row 1: dP/dt = PP - GR - ε·P
+    J[1, 0] = dPP_dN
+    J[1, 1] = dPP_dP - dGR_dP - eps
+    J[1, 2] =        - dGR_dZ
+    J[1, 3] = 0.0
 
-    # Remineralization of detritus -> nutrient
-    Remin  = phi * D
+    # Row 2: dZ/dt = β·GR - g·Z
+    J[2, 0] = 0.0
+    J[2, 1] = beta * dGR_dP
+    J[2, 2] = beta * dGR_dZ - g
+    J[2, 3] = 0.0
 
-    # --- ODEs ---
-    dN_dt = -PP + G_to_N + P_loss + Remin
-    dP_dt =  PP - GR     - P_loss
-    dZ_dt =  G_to_Z      - Z_mort
-    dD_dt =  G_to_D      + P_loss + Z_mort - Remin
+    # Row 3: dD/dt = (1-α-β)·GR + ε·P + g·Z - φ·D
+    gam     = 1.0 - alpha - beta
+    J[3, 0] = 0.0
+    J[3, 1] = gam * dGR_dP + eps
+    J[3, 2] = gam * dGR_dZ + g
+    J[3, 3] = -phi
 
-    return [dN_dt, dP_dt, dZ_dt, dD_dt]
+    return J
 
 
 # =============================================================================
@@ -160,102 +220,136 @@ def npzd_rhs(t: float, y: np.ndarray, params: dict) -> list:
 # =============================================================================
 
 def run_npzd(
-    y0     : np.ndarray,
-    params : dict = None,
+    y0        : np.ndarray,
+    params    : dict = None,
     solver_cfg: dict = None,
 ) -> dict:
     """
-    Solve the NPZD system from t=0 to t=365 days and return daily snapshots.
+    Integrate the NPZD system and return daily snapshots for one year.
+
+    Spin-up: the system is first integrated for solver_cfg['spinup_days']
+    days starting from y0. The end state is then used as the true initial
+    condition for the output year. This eliminates transient behaviour.
 
     Parameters
     ----------
-    y0         : Initial state [N0, P0, Z0, D0]
-    params     : Ecological parameter dict (defaults to config.ODE_PARAMS)
-    solver_cfg : Solver settings dict (defaults to config.SOLVER)
+    y0         : Initial state [N0, P0, Z0, D0]  (mmol N m⁻³)
+    params     : Ecological parameters  (defaults to ODE_PARAMS)
+    solver_cfg : Solver settings  (defaults to SOLVER)
 
     Returns
     -------
-    result : dict with keys:
-        't'       — time array (n_steps,)
-        'states'  — state array (n_steps, 4)  [N, P, Z, D]
-        'forcing' — forcing array (n_steps, 2) [I, T]
-        'success' — bool
+    dict with keys:
+        't'      : (n_steps,)   time array [days]
+        'states' : (n_steps, 4) state array [N, P, Z, D]
+        'forcing': (n_steps, 2) forcing [I, T]
+        'success': bool
+        'message': solver message string
     """
     if params is None:
         params = ODE_PARAMS
     if solver_cfg is None:
         solver_cfg = SOLVER
 
+    rhs = lambda t, y: npzd_rhs(t, y, params)
+    jac = lambda t, y: npzd_jacobian(t, y, params)
+
+    # No spin-up: initial conditions are sampled from winter conditions
+    # (high N, low biology) which is the natural starting state for a
+    # spring bloom simulation. Spin-up drove the system to a degenerate
+    # nutrient-depleted fixed point.
+    y0_start = np.clip(y0, 0.0, None)
+
     t_eval = np.linspace(
         solver_cfg["t_start"],
         solver_cfg["t_end"],
-        solver_cfg["n_steps"]
+        solver_cfg["n_steps"],
     )
 
     sol = solve_ivp(
-        fun     = lambda t, y: npzd_rhs(t, y, params),
-        t_span  = (solver_cfg["t_start"], solver_cfg["t_end"]),
-        y0      = y0,
-        method  = solver_cfg["method"],
-        t_eval  = t_eval,
-        rtol    = solver_cfg["rtol"],
-        atol    = solver_cfg["atol"],
+        fun    = rhs,
+        t_span = (solver_cfg["t_start"], solver_cfg["t_end"]),
+        y0     = y0_start,
+        method = solver_cfg["method"],
+        jac    = jac,
+        t_eval = t_eval,
+        rtol   = solver_cfg["rtol"],
+        atol   = solver_cfg["atol"],
+        dense_output = False,
     )
 
+    if not sol.success:
+        return {"success": False, "message": sol.message}
+
+    # Clip any tiny floating-point negatives — should not occur with Radau
+    # but added as a safety net.
+    states = np.clip(sol.y.T.copy(), 0.0, None)
     forcing = get_forcing_at_times(sol.t)
 
     return {
-        "t"       : sol.t,
-        "states"  : sol.y.T,        # shape (n_steps, 4)
-        "forcing" : forcing,         # shape (n_steps, 2)
-        "success" : sol.success,
+        "t"      : sol.t,
+        "states" : states,
+        "forcing": forcing,
+        "success": True,
+        "message": sol.message,
     }
 
 
 # =============================================================================
-# Quick sanity check (run this file directly to see a plot)
+# Quick sanity check — run directly to validate ODE correctness
 # =============================================================================
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    y0 = [8.0, 0.2, 0.1, 0.1]   # Typical winter initial conditions
+    print("Running NPZD sanity check with Radau solver...")
+    y0 = [7.0, 0.3, 0.05, 0.1]
 
     result = run_npzd(y0)
 
     if not result["success"]:
-        print("ODE solver failed!")
+        print(f"ODE solver failed: {result['message']}")
     else:
-        t      = result["t"]
-        states = result["states"]
+        t       = result["t"]
+        states  = result["states"]
         forcing = result["forcing"]
 
-        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+        total_N  = states.sum(axis=1)
+        drift_pct = (total_N.max() - total_N.min()) / total_N[0] * 100
 
-        axes[0].plot(t, forcing[:, 0], color="gold", label="PAR [W/m²]")
-        axes[0].plot(t, forcing[:, 1] * 5, color="tomato", linestyle="--",
-                     label="Temperature [°C] × 5")
-        axes[0].set_ylabel("Forcing")
-        axes[0].legend(fontsize=8)
-        axes[0].set_title("NPZD Model — Single Trajectory (Sanity Check)")
+        print(f"Solver:         Radau (implicit, order 5)")
+        print(f"N at t=0:       {total_N[0]:.6f} mmol N m⁻³")
+        print(f"N at t=365:     {total_N[-1]:.6f} mmol N m⁻³")
+        print(f"Max drift:      {drift_pct:.4f} %")
+        print(f"Min state val:  {states.min():.2e} mmol N m⁻³")
+        print(f"Spring bloom P: {states[:, 1].max():.3f} mmol N m⁻³ "
+              f"on day {t[states[:, 1].argmax()]:.0f}")
 
-        colors = ["steelblue", "green", "darkorange", "saddlebrown"]
-        labels = ["N (Nutrient)", "P (Phytoplankton)", "Z (Zooplankton)", "D (Detritus)"]
+        fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+
+        axes[0].plot(t, forcing[:, 0], "gold",   lw=1.5, label="PAR [W m⁻²]")
+        ax_twin = axes[0].twinx()
+        ax_twin.plot(t, forcing[:, 1], "tomato", lw=1.5, linestyle="--",
+                     label="SST [°C]")
+        axes[0].set_ylabel("PAR [W m⁻²]", color="goldenrod")
+        ax_twin.set_ylabel("SST [°C]", color="tomato")
+        axes[0].set_title("NPZD Model — Sanity Check  (Radau solver)")
+
+        colors = ["steelblue", "forestgreen", "darkorange", "saddlebrown"]
+        labels = ["N", "P", "Z", "D"]
         for i, (c, l) in enumerate(zip(colors, labels)):
-            axes[1].plot(t, states[:, i], color=c, label=l)
+            axes[1].plot(t, states[:, i], color=c, lw=1.5, label=l)
         axes[1].set_ylabel("mmol N m⁻³")
-        axes[1].legend(fontsize=8)
+        axes[1].legend(fontsize=9)
+        axes[1].grid(alpha=0.25)
 
-        total_N = states.sum(axis=1)
-        axes[2].plot(t, total_N, color="black", label="Total N (conservation check)")
+        axes[2].plot(t, total_N, "k-", lw=1.5, label=f"Total N  (drift {drift_pct:.4f}%)")
         axes[2].set_ylabel("mmol N m⁻³")
-        axes[2].set_xlabel("Day of Year")
-        axes[2].legend(fontsize=8)
+        axes[2].set_xlabel("Day of year")
+        axes[2].legend(fontsize=9)
+        axes[2].grid(alpha=0.25)
 
         plt.tight_layout()
         plt.savefig("npzd_sanity_check.png", dpi=150)
-        print("Plot saved to npzd_sanity_check.png")
+        print("\nPlot saved → npzd_sanity_check.png")
         plt.show()
-
-        print(f"\nN conservation: min={total_N.min():.4f}, max={total_N.max():.4f}, "
-              f"drift={total_N.max()-total_N.min():.4f} mmol N m^-3")

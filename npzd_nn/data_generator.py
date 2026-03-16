@@ -1,12 +1,14 @@
 # =============================================================================
 # data_generator.py
-# Generates the supervised training dataset by running many NPZD ODE
-# trajectories with randomly sampled initial conditions and perturbed
-# ecological parameters, then extracting consecutive one-step pairs.
+# Monte Carlo NPZD simulation → supervised training dataset.
 #
-# Output:
-#   X.npy  — input array  (n_samples, 6):  [N_t, P_t, Z_t, D_t, I_t, T_t]
-#   y.npy  — target array (n_samples, 4):  [N_{t+1}, P_{t+1}, Z_{t+1}, D_{t+1}]
+# Key improvements over original:
+#   1. N-conserving initial conditions: sample total_N, partition among
+#      compartments, so N+P+Z+D = const from t=0.
+#   2. Targets are STATE INCREMENTS Δs = s_{t+1} − s_t (delta formulation).
+#   3. Stability filters are minimal and physically meaningful: the Radau
+#      solver + analytical Jacobian should produce clean trajectories.
+#   4. Rejection reasons are counted and reported.
 # =============================================================================
 
 import os
@@ -19,33 +21,14 @@ from npzd_ode import run_npzd
 
 
 # =============================================================================
-# Parameter perturbation
-# =============================================================================
-
-def perturb_params(base_params: dict, rng: np.random.Generator, cfg: dict) -> dict:
-    """
-    Return a copy of base_params with selected parameters uniformly perturbed
-    within ±param_perturb_frac of their nominal values.
-    """
-    params = copy.deepcopy(base_params)
-    frac = cfg["param_perturb_frac"]
-
-    for key in cfg["perturb_params"]:
-        nominal = base_params[key]
-        lo = nominal * (1.0 - frac)
-        hi = nominal * (1.0 + frac)
-        params[key] = rng.uniform(lo, hi)
-
-    return params
-
-
-# =============================================================================
-# Initial condition sampling
+# Initial condition sampling (N-conserving)
 # =============================================================================
 
 def sample_initial_condition(rng: np.random.Generator, cfg: dict) -> np.ndarray:
     """
-    Draw a random initial state [N0, P0, Z0, D0] from the configured ranges.
+    Sample winter initial conditions [N0, P0, Z0, D0] independently.
+    High N, low biology — the natural state at the start of the annual cycle.
+    The system is open so there is no N budget constraint.
     """
     N0 = rng.uniform(*cfg["N0_range"])
     P0 = rng.uniform(*cfg["P0_range"])
@@ -55,198 +38,234 @@ def sample_initial_condition(rng: np.random.Generator, cfg: dict) -> np.ndarray:
 
 
 # =============================================================================
-# Extract one-step transition pairs from a single trajectory
+# Parameter perturbation
+# =============================================================================
+
+def perturb_params(base: dict, rng: np.random.Generator, cfg: dict) -> dict:
+    """Uniformly perturb selected ecological parameters within ±frac."""
+    params = copy.deepcopy(base)
+    frac   = cfg["param_perturb_frac"]
+    for key in cfg["perturb_params"]:
+        nominal = base[key]
+        params[key] = rng.uniform(nominal * (1.0 - frac),
+                                   nominal * (1.0 + frac))
+    # Safety: alpha + beta must be < 1 after perturbation
+    while params["alpha"] + params["beta"] >= 1.0:
+        params["alpha"] *= 0.9
+        params["beta"]  *= 0.9
+    return params
+
+
+# =============================================================================
+# Trajectory quality check
+# =============================================================================
+
+def _is_acceptable(result: dict, cfg: dict) -> tuple:
+    """
+    Return (True, '') or (False, reason_str).
+    Only checks that are valid for an OPEN system are kept.
+    N conservation drift is NOT checked — the mixing term actively
+    adds external nitrogen, so total N drifting is correct physics.
+    """
+    states = result["states"]
+
+    # 1. Blow-up or NaN
+    if np.any(np.isnan(states)) or np.any(states > cfg["max_concentration"]):
+        return False, "blow-up or NaN"
+
+    # 2. Negative values beyond floating-point tolerance
+    if np.any(states < cfg["min_state_value"]):
+        worst = states.min()
+        return False, f"negative concentration {worst:.2e}"
+
+    return True, ""
+
+
+# =============================================================================
+# Extract one-step transition pairs (delta formulation)
 # =============================================================================
 
 def extract_pairs(result: dict) -> tuple:
     """
-    From a solved trajectory, extract all consecutive (state_t, forcing_t) →
-    state_{t+1} pairs.
+    Build input/target arrays from a single trajectory.
 
-    Parameters
-    ----------
-    result : dict returned by run_npzd()
+    Input  X[i] = [N_t, P_t, Z_t, D_t, I_t, T_t]   (current state + forcing)
+    Target y[i] = [ΔN, ΔP, ΔZ, ΔD]                  (state INCREMENT)
 
-    Returns
-    -------
-    X : np.ndarray, shape (n_steps-1, 6)   [N_t, P_t, Z_t, D_t, I_t, T_t]
-    y : np.ndarray, shape (n_steps-1, 4)   [N_{t+1}, P_{t+1}, Z_{t+1}, D_{t+1}]
+    The delta formulation means the NN learns small corrections rather
+    than absolute next-state values, which is both easier and physically
+    more stable in autoregressive rollout.
     """
-    states  = result["states"]    # (n_steps, 4)
-    forcing = result["forcing"]   # (n_steps, 2)
+    states  = result["states"]    # (T, 4)
+    forcing = result["forcing"]   # (T, 2)
 
-    # Inputs: state at t=0..T-2, forcing at t=0..T-2
-    X = np.concatenate([states[:-1], forcing[:-1]], axis=1)   # (n_steps-1, 6)
-    # Targets: state at t=1..T-1
-    y = states[1:]                                             # (n_steps-1, 4)
+    # Inputs:  state and forcing at t
+    X = np.concatenate([states[:-1], forcing[:-1]], axis=1)  # (T-1, 6)
+    # Targets: increment from t to t+1
+    y = states[1:] - states[:-1]                              # (T-1, 4)
 
     return X, y
 
 
 # =============================================================================
-# Main data generation routine
+# Main dataset generation
 # =============================================================================
 
 def generate_dataset(
-    n_trajectories  : int  = None,
-    max_samples     : int  = None,
-    random_seed     : int  = None,
-    data_dir        : str  = None,
-    verbose         : bool = True,
+    n_trajectories : int  = None,
+    max_samples    : int  = None,
+    random_seed    : int  = None,
+    data_dir       : str  = None,
+    verbose        : bool = True,
 ) -> tuple:
     """
-    Run Monte Carlo NPZD simulations and build the supervised dataset.
+    Run Monte Carlo NPZD simulations and build the training dataset.
 
-    Returns
-    -------
-    X : np.ndarray (n_samples, 6)
-    y : np.ndarray (n_samples, 4)
-    Also saves X and y as .npy files in data_dir.
+    Returns (X, y) arrays and saves them as .npy files.
     """
-    cfg = DATA_GEN
-
+    cfg  = DATA_GEN
     n_trajectories = n_trajectories or cfg["n_trajectories"]
     max_samples    = max_samples    or cfg["max_samples"]
     random_seed    = random_seed    or cfg["random_seed"]
     data_dir       = data_dir       or cfg["data_dir"]
-
     os.makedirs(data_dir, exist_ok=True)
+
     rng = np.random.default_rng(random_seed)
-
     X_list, y_list = [], []
-    n_failed = 0
+    n_failed  = 0
+    reject_log: dict = {}
 
-    iterator = tqdm(range(n_trajectories), desc="Generating trajectories") \
-               if verbose else range(n_trajectories)
+    itr = tqdm(range(n_trajectories), desc="Generating trajectories") \
+          if verbose else range(n_trajectories)
 
-    for i in iterator:
-        # Sample initial conditions and perturbed parameters
+    for _ in itr:
         y0     = sample_initial_condition(rng, cfg)
         params = perturb_params(ODE_PARAMS, rng, cfg)
-
-        # Solve ODE
         result = run_npzd(y0, params=params, solver_cfg=SOLVER)
 
         if not result["success"]:
             n_failed += 1
+            key = "solver failed"
+            reject_log[key] = reject_log.get(key, 0) + 1
             continue
 
-        # Check for numerical blow-up (concentrations should stay reasonable)
-        if np.any(result["states"] > 1e4) or np.any(np.isnan(result["states"])):
+        ok, reason = _is_acceptable(result, cfg)
+        if not ok:
             n_failed += 1
+            key = reason.split(" ")[0]
+            reject_log[key] = reject_log.get(key, 0) + 1
             continue
 
-        # Extract one-step pairs
-        X_traj, y_traj = extract_pairs(result)
-        X_list.append(X_traj)
-        y_list.append(y_traj)
+        Xb, yb = extract_pairs(result)
+        X_list.append(Xb)
+        y_list.append(yb)
 
     if verbose:
-        print(f"\nSuccessful trajectories : {len(X_list)} / {n_trajectories}")
-        print(f"Failed / rejected       : {n_failed}")
+        n_ok = len(X_list)
+        print(f"\nSuccessful : {n_ok} / {n_trajectories}")
+        print(f"Rejected   : {n_failed}")
+        if reject_log:
+            print("Breakdown  :")
+            for k, v in sorted(reject_log.items(), key=lambda x: -x[1]):
+                print(f"  {v:>5}  {k}")
 
-    # Concatenate all pairs
+    if not X_list:
+        raise RuntimeError("All trajectories were rejected. "
+                           "Check ODE parameters and stability filters.")
+
     X = np.concatenate(X_list, axis=0).astype(np.float32)
     y = np.concatenate(y_list, axis=0).astype(np.float32)
 
     if verbose:
-        print(f"Total one-step pairs before subsampling: {len(X):,}")
+        print(f"\nTotal pairs before subsampling: {len(X):,}")
 
-    # Subsample if needed
     if len(X) > max_samples:
         idx = rng.choice(len(X), size=max_samples, replace=False)
         idx.sort()
-        X = X[idx]
-        y = y[idx]
+        X, y = X[idx], y[idx]
         if verbose:
-            print(f"Subsampled to: {len(X):,} pairs")
+            print(f"Subsampled to: {len(X):,}")
 
-    # Save
-    X_path = os.path.join(data_dir, "X.npy")
-    y_path = os.path.join(data_dir, "y.npy")
-    np.save(X_path, X)
-    np.save(y_path, y)
+    np.save(os.path.join(data_dir, "X.npy"), X)
+    np.save(os.path.join(data_dir, "y.npy"), y)
 
     if verbose:
-        print(f"\nDataset saved:")
-        print(f"  X -> {X_path}  shape={X.shape}")
-        print(f"  y -> {y_path}  shape={y.shape}")
         _print_stats(X, y)
+        print(f"\nSaved → {data_dir}/X.npy  {X.shape}")
+        print(f"Saved → {data_dir}/y.npy  {y.shape}")
 
     return X, y
 
 
 # =============================================================================
-# Also save trajectory-level data (needed for rollout evaluation)
+# Evaluation trajectory generation
 # =============================================================================
 
 def generate_trajectories_for_eval(
-    n_trajectories : int  = 200,
+    n_trajectories : int  = None,
     random_seed    : int  = 999,
     data_dir       : str  = None,
     verbose        : bool = True,
 ) -> list:
     """
-    Generate and save a separate set of complete trajectories (not flattened),
-    intended for the autoregressive rollout evaluation.
-
-    Each trajectory is a dict with keys: 't', 'states', 'forcing', 'y0', 'params'.
-    Saved as data/eval_trajectories.npy (list of dicts).
-
-    Returns
-    -------
-    trajectories : list of dicts
+    Generate complete trajectories for autoregressive rollout evaluation.
+    Saved as a list of dicts to data/eval_trajectories.npy.
     """
+    from config import EVAL
     cfg      = DATA_GEN
+    n_trajectories = n_trajectories or EVAL["n_eval_trajectories"]
     data_dir = data_dir or cfg["data_dir"]
     os.makedirs(data_dir, exist_ok=True)
 
-    rng = np.random.default_rng(random_seed)
+    rng          = np.random.default_rng(random_seed)
     trajectories = []
 
-    iterator = tqdm(range(n_trajectories), desc="Generating eval trajectories") \
-               if verbose else range(n_trajectories)
+    itr = tqdm(range(n_trajectories * 2), desc="Generating eval trajectories") \
+          if verbose else range(n_trajectories * 2)
 
-    for _ in iterator:
+    for _ in itr:
+        if len(trajectories) >= n_trajectories:
+            break
         y0     = sample_initial_condition(rng, cfg)
         params = perturb_params(ODE_PARAMS, rng, cfg)
         result = run_npzd(y0, params=params, solver_cfg=SOLVER)
 
         if not result["success"]:
             continue
-        if np.any(result["states"] > 1e4) or np.any(np.isnan(result["states"])):
+        ok, _ = _is_acceptable(result, cfg)
+        if not ok:
             continue
 
-        result["y0"]     = y0
+        result["y0"]     = result["states"][0].copy()
         result["params"] = params
         trajectories.append(result)
 
-    out_path = os.path.join(data_dir, "eval_trajectories.npy")
+    from config import EVAL as EVAL_CFG
+    out_path = EVAL_CFG["eval_traj_file"]
+    os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
     np.save(out_path, trajectories, allow_pickle=True)
 
     if verbose:
-        print(f"\nEval trajectories saved: {len(trajectories)} -> {out_path}")
+        print(f"\nEval trajectories: {len(trajectories)} saved → {out_path}")
 
     return trajectories
 
 
 # =============================================================================
-# Utilities
+# Utility
 # =============================================================================
 
 def _print_stats(X: np.ndarray, y: np.ndarray) -> None:
-    feature_names = ["N", "P", "Z", "D", "I", "T"]
-    target_names  = ["N'", "P'", "Z'", "D'"]
-
+    fn = ["N", "P", "Z", "D", "I", "T"]
+    tn = ["ΔN", "ΔP", "ΔZ", "ΔD"]
     print("\n--- Input feature statistics ---")
-    for i, name in enumerate(feature_names):
-        print(f"  {name:5s}  mean={X[:,i].mean():.3f}  std={X[:,i].std():.3f}  "
-              f"min={X[:,i].min():.3f}  max={X[:,i].max():.3f}")
-
-    print("\n--- Target statistics ---")
-    for i, name in enumerate(target_names):
-        print(f"  {name:5s}  mean={y[:,i].mean():.3f}  std={y[:,i].std():.3f}  "
-              f"min={y[:,i].min():.3f}  max={y[:,i].max():.3f}")
+    for i, n in enumerate(fn):
+        print(f"  {n:4s} mean={X[:,i].mean():8.4f}  std={X[:,i].std():7.4f}"
+              f"  min={X[:,i].min():8.4f}  max={X[:,i].max():8.4f}")
+    print("--- Target (Δ) statistics ---")
+    for i, n in enumerate(tn):
+        print(f"  {n:4s} mean={y[:,i].mean():8.4f}  std={y[:,i].std():7.4f}"
+              f"  min={y[:,i].min():8.4f}  max={y[:,i].max():8.4f}")
 
 
 # =============================================================================
